@@ -10,7 +10,7 @@ struct Version {
     body: String,
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).expect("path to project needed");
     let mut function_map = HashMap::<String, Vec<Version>>::new();
 
@@ -23,7 +23,7 @@ fn main() {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
-        let src = std::fs::read_to_string(path).unwrap();
+        let src = std::fs::read_to_string(path)?;
         let Ok(ast) = syn::parse_file(&src) else {
             // invalid rust ignored
             continue;
@@ -42,24 +42,23 @@ fn main() {
     }
 
     const DIFF_DIF: &str = "diff";
-    let _ = std::fs::remove_dir_all(DIFF_DIF);
-    std::fs::create_dir(DIFF_DIF).unwrap();
+    let _ = std::fs::remove_dir_all(DIFF_DIF); // fails on first run
+    std::fs::create_dir(DIFF_DIF)?;
 
     for (name, body_list) in &function_map {
         // only duplicates
         if body_list.len() > 1 {
             let version_dir = format!("{DIFF_DIF}/{name}");
-            std::fs::create_dir_all(&version_dir).unwrap();
+            let _ = std::fs::create_dir_all(&version_dir);
             for (index, version) in body_list.iter().enumerate() {
-                let file_name = version.file.clone();
+                let Version { file, body } = version;
                 let path = format!("{version_dir}/{index}.rs");
+                let content = format!("// function found in {file}\n\n{body}");
 
-                let body = version.body.clone();
-                let content = format!("// function found in {file_name}\n\n{body}");
-                std::fs::write(&path, content).unwrap();
-
-                Command::new("rustfmt").arg(&path).status().unwrap();
+                std::fs::write(&path, content)?;
+                Command::new("rustfmt").arg(&path).status()?;
             }
         }
     }
+    Ok(())
 }
