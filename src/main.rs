@@ -1,18 +1,27 @@
-use std::{collections::HashMap, process::Command};
+use std::{
+    collections::{HashMap, HashSet},
+    process::Command,
+};
 
+use syn::{Item, ItemStruct, Signature};
 use walkdir::WalkDir;
 
 // accumulates same-name functions and collects versions,
 // versions -> files in a "diff" dir of the function name, found in the main "diff" dir
 
 struct Version {
-    file: String,
+    file_path: String,
     body: String,
 }
+// want to tell if there are any usr-defined structs passed in the arg list
+// get all structs defined, then filter the lists
 
 fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).expect("path to project needed");
     let mut function_map = HashMap::<String, Vec<Version>>::new();
+    let mut free_floating_functions_count = 0;
+    let mut impl_functions_count = 0;
+    let mut associated_functions_count = 0;
 
     for entry in WalkDir::new(dir)
         .into_iter()
@@ -32,11 +41,22 @@ fn main() -> anyhow::Result<()> {
             if let syn::Item::Fn(f) = item {
                 let name = f.sig.ident.to_string();
                 let body = quote::quote!(#f).to_string();
-
-                function_map.entry(name).or_default().push(Version {
-                    file: path.display().to_string(),
-                    body: body,
-                });
+                let file_path = path.display().to_string();
+                free_floating_functions_count += 1;
+                function_map
+                    .entry(name)
+                    .or_default()
+                    .push(Version { file_path, body });
+            } else if let syn::Item::Impl(f) = item {
+                for impl_item in f.items {
+                    if let syn::ImplItem::Fn(f) = impl_item {
+                        if f.sig.receiver().is_some() {
+                            impl_functions_count += 1;
+                        } else {
+                            associated_functions_count += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -51,14 +71,21 @@ fn main() -> anyhow::Result<()> {
             let version_dir = format!("{DIFF_DIF}/{name}");
             let _ = std::fs::create_dir_all(&version_dir);
             for (index, version) in body_list.iter().enumerate() {
-                let Version { file, body } = version;
+                let Version { file_path, body } = version;
                 let path = format!("{version_dir}/{index}.rs");
-                let content = format!("// function found in {file}\n\n{body}");
+                let content = format!("// function found in {file_path}\n\n{body}");
 
                 std::fs::write(&path, content)?;
                 Command::new("rustfmt").arg(&path).status()?;
             }
         }
     }
+
+    println!("Number of free floating functions {free_floating_functions_count}");
+    println!("Number of impl functions {impl_functions_count}");
+    println!("Number of associated functions {associated_functions_count}");
+
+    let total = free_floating_functions_count + impl_functions_count + associated_functions_count;
+    println!("Total number of functions {total}");
     Ok(())
 }
