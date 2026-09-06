@@ -1,9 +1,7 @@
-use std::{
-    collections::{HashMap, HashSet},
-    process::Command,
-};
-
-use syn::{Item, ItemStruct, Signature};
+use dashmap::DashMap;
+use rayon::prelude::*;
+use std::sync::atomic::*;
+use std::{process::Command, sync::atomic::AtomicUsize};
 use walkdir::WalkDir;
 
 // accumulates same-name functions and collects versions,
@@ -18,31 +16,32 @@ struct Version {
 
 fn main() -> anyhow::Result<()> {
     let dir = std::env::args().nth(1).expect("path to project needed");
-    let mut function_map = HashMap::<String, Vec<Version>>::new();
-    let mut free_floating_functions_count = 0;
-    let mut impl_functions_count = 0;
-    let mut associated_functions_count = 0;
+    let function_map = DashMap::<String, Vec<Version>>::new();
+    let free_floating_functions_count = AtomicUsize::new(0);
+    let impl_functions_count = AtomicUsize::new(0);
+    let associated_functions_count = AtomicUsize::new(0);
 
-    for entry in WalkDir::new(dir)
+    let paths: Vec<_> = WalkDir::new(dir)
         .into_iter()
-        .filter_entry(|e| e.file_name() != "target") // skips garbage
+        .filter_entry(|e| e.file_name() != "target")
         .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let src = std::fs::read_to_string(path)?;
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+
+    paths.par_iter().for_each(|path| {
+        let Ok(src) = std::fs::read_to_string(path) else {
+            return;
+        };
         let Ok(ast) = syn::parse_file(&src) else {
-            // invalid rust ignored
-            continue;
+            return;
         };
         for item in ast.items {
             if let syn::Item::Fn(f) = item {
                 let name = f.sig.ident.to_string();
                 let body = quote::quote!(#f).to_string();
                 let file_path = path.display().to_string();
-                free_floating_functions_count += 1;
+                free_floating_functions_count.fetch_add(1, Ordering::Relaxed);
                 function_map
                     .entry(name)
                     .or_default()
@@ -51,21 +50,22 @@ fn main() -> anyhow::Result<()> {
                 for impl_item in f.items {
                     if let syn::ImplItem::Fn(f) = impl_item {
                         if f.sig.receiver().is_some() {
-                            impl_functions_count += 1;
+                            impl_functions_count.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            associated_functions_count += 1;
+                            associated_functions_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
             }
         }
-    }
+    });
 
     const DIFF_DIF: &str = "diff";
     let _ = std::fs::remove_dir_all(DIFF_DIF); // fails on first run
     std::fs::create_dir(DIFF_DIF)?;
 
-    for (name, body_list) in &function_map {
+    let mut paths_to_format = Vec::<String>::new();
+    for (name, body_list) in function_map {
         // only duplicates
         if body_list.len() > 1 {
             let version_dir = format!("{DIFF_DIF}/{name}");
@@ -74,18 +74,24 @@ fn main() -> anyhow::Result<()> {
                 let Version { file_path, body } = version;
                 let path = format!("{version_dir}/{index}.rs");
                 let content = format!("// function found in {file_path}\n\n{body}");
-
-                std::fs::write(&path, content)?;
-                Command::new("rustfmt").arg(&path).status()?;
+                std::fs::write(path.clone(), content)?;
+                paths_to_format.push(path);
             }
         }
     }
 
-    println!("Number of free floating functions {free_floating_functions_count}");
-    println!("Number of impl functions {impl_functions_count}");
-    println!("Number of associated functions {associated_functions_count}");
+    // formats all files
+    Command::new("rustfmt").args(paths_to_format).status()?;
 
-    let total = free_floating_functions_count + impl_functions_count + associated_functions_count;
+    let free_count = free_floating_functions_count.load(Ordering::Relaxed);
+    let impl_count = impl_functions_count.load(Ordering::Relaxed);
+    let associated_count = associated_functions_count.load(Ordering::Relaxed);
+
+    println!("Number of free floating functions {free_count}");
+    println!("Number of impl functions {impl_count}");
+    println!("Number of associated functions {associated_count}");
+
+    let total = free_count + impl_count + associated_count;
     println!("Total number of functions {total}");
     Ok(())
 }
