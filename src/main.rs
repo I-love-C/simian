@@ -1,20 +1,22 @@
 use dashmap::DashMap;
+use ra_ap_syntax::ast::{HasModuleItem, HasName};
+use ra_ap_syntax::{AstNode, SourceFile, ast};
 use rayon::prelude::*;
+use std::path::PathBuf;
 use std::sync::atomic::*;
-use std::{process::Command, sync::atomic::AtomicUsize};
 use walkdir::WalkDir;
 
-// accumulates same-name functions and collects versions,
-// versions -> files in a "diff" dir of the function name, found in the main "diff" dir
-
 struct Version {
-    file_path: String,
+    file_path: PathBuf,
     body: String,
 }
-// want to tell if there are any usr-defined structs passed in the arg list
-// get all structs defined, then filter the lists
 
-fn main() -> anyhow::Result<()> {
+// gets an overview of function stats in a rust project and generates a diff directory for manual
+// inspection of same-name functions across a codebase
+//
+// accumulates same-name functions and collects versions,
+// versions -> files in a "diff" dir of the function name, found in the main "diff" dir
+fn main() {
     let dir = std::env::args().nth(1).expect("path to project needed");
     let function_map = DashMap::<String, Vec<Version>>::new();
     let free_floating_functions_count = AtomicUsize::new(0);
@@ -33,36 +35,48 @@ fn main() -> anyhow::Result<()> {
         let Ok(src) = std::fs::read_to_string(path) else {
             return;
         };
-        let Ok(ast) = syn::parse_file(&src) else {
-            return;
-        };
-        for item in ast.items {
-            if let syn::Item::Fn(f) = item {
-                let name = f.sig.ident.to_string();
-                let body = quote::quote!(#f).to_string();
-                let file_path = path.display().to_string();
-                free_floating_functions_count.fetch_add(1, Ordering::Relaxed);
-                function_map
-                    .entry(name)
-                    .or_default()
-                    .push(Version { file_path, body });
-            } else if let syn::Item::Impl(f) = item {
-                for impl_item in f.items {
-                    if let syn::ImplItem::Fn(f) = impl_item {
-                        if f.sig.receiver().is_some() {
-                            impl_functions_count.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            associated_functions_count.fetch_add(1, Ordering::Relaxed);
+
+        let items = SourceFile::parse(&src, ra_ap_syntax::Edition::Edition2021)
+            .tree()
+            .items();
+
+        for item in items {
+            match item {
+                ast::Item::Fn(f) => {
+                    let name = f.name().map(|n| n.text().to_string()).unwrap_or_default();
+                    let body = f.syntax().text().to_string();
+
+                    free_floating_functions_count.fetch_add(1, Ordering::Relaxed);
+                    function_map.entry(name).or_default().push(Version {
+                        file_path: path.clone(),
+                        body: body,
+                    });
+                }
+                ast::Item::Impl(imp) => {
+                    let Some(items) = imp.assoc_item_list() else {
+                        continue;
+                    };
+                    for assoc in items.assoc_items() {
+                        if let ast::AssocItem::Fn(f) = assoc {
+                            let has_receiver =
+                                f.param_list().and_then(|pl| pl.self_param()).is_some();
+                            if has_receiver {
+                                impl_functions_count.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                associated_functions_count.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
+                _ => {}
             }
         }
     });
 
     const DIFF_DIF: &str = "diff";
     let _ = std::fs::remove_dir_all(DIFF_DIF); // fails on first run
-    std::fs::create_dir(DIFF_DIF)?;
+    _ = std::fs::create_dir(DIFF_DIF)
+        .map_err(|e| eprintln!("Cannot create diff dir, reason : {e}"));
 
     let mut paths_to_format = Vec::<String>::new();
     for (name, body_list) in function_map {
@@ -73,15 +87,14 @@ fn main() -> anyhow::Result<()> {
             for (index, version) in body_list.iter().enumerate() {
                 let Version { file_path, body } = version;
                 let path = format!("{version_dir}/{index}.rs");
+                let file_path = file_path.display();
                 let content = format!("// function found in {file_path}\n\n{body}");
-                std::fs::write(path.clone(), content)?;
+                _ = std::fs::write(path.clone(), content)
+                    .map_err(|e| eprintln!("Couldn't write to file {path}, reason : {e}"));
                 paths_to_format.push(path);
             }
         }
     }
-
-    // formats all files
-    Command::new("rustfmt").args(paths_to_format).status()?;
 
     let free_count = free_floating_functions_count.load(Ordering::Relaxed);
     let impl_count = impl_functions_count.load(Ordering::Relaxed);
@@ -93,5 +106,4 @@ fn main() -> anyhow::Result<()> {
 
     let total = free_count + impl_count + associated_count;
     println!("Total number of functions {total}");
-    Ok(())
 }
